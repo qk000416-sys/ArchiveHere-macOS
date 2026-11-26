@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <locale.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +39,31 @@ static bool safe_member_path(const char *path) {
     return true;
 }
 
+// A framework contains relative symlinks. Keep libarchive's no-follow write
+// protection, then verify every link after extraction, before publication.
+struct extracted_link {
+    char *path;
+    struct extracted_link *next;
+};
+
+static bool safe_link_target(const char *member, const char *target) {
+    if (!target || !*target || *target == '/') return false;
+    size_t depth = 0;
+    for (const char *p = member; *p; ++p) if (*p == '/') ++depth;
+    while (*target) {
+        size_t n = strcspn(target, "/");
+        if (n == 2 && target[0] == '.' && target[1] == '.') {
+            if (!depth) return false;
+            --depth;
+        } else if (n && !(n == 1 && target[0] == '.')) {
+            ++depth;
+        }
+        target += n;
+        if (*target) ++target;
+    }
+    return true;
+}
+
 int extract_archive(const char *source, const char *staging,
                     const char *stream_name, char *error, size_t error_size) {
     int result = -1;
@@ -46,6 +72,15 @@ int extract_archive(const char *source, const char *staging,
     struct archive *writer = NULL;
     struct stat source_stat;
     bool empty_stream = false;
+    struct extracted_link *links = NULL;
+    // macOS /var and /tmp are symlinks. Canonicalize the staging parent so
+    // libarchive's secure-symlinks check only sees links from the archive.
+    char canonical_staging[PATH_MAX];
+    if (!realpath(staging, canonical_staging)) {
+        report_error(error, error_size, "无法读取解压目录。", NULL);
+        return -1;
+    }
+    staging = canonical_staging;
     locale_t utf8 = newlocale(LC_CTYPE_MASK, "en_US.UTF-8", NULL);
     locale_t previous_locale = utf8 ? uselocale(utf8) : NULL;
 
@@ -115,9 +150,9 @@ int extract_archive(const char *source, const char *staging,
             report_error(error, error_size, "此版本无法解压需要密码的压缩包。", NULL);
             goto finish;
         }
-        if ((type != S_IFREG && type != S_IFDIR)
-            || archive_entry_hardlink(entry) || archive_entry_symlink(entry)) {
-            report_error(error, error_size, "压缩包含有链接或特殊文件，无法解压。", NULL);
+        if ((type != S_IFREG && type != S_IFDIR && type != S_IFLNK)
+            || archive_entry_hardlink(entry)) {
+            report_error(error, error_size, "压缩包含有不支持的硬链接或特殊文件。", NULL);
             goto finish;
         }
         if (!safe_member_path(member)) {
@@ -139,13 +174,29 @@ int extract_archive(const char *source, const char *staging,
             goto finish;
         }
 
+        if (type == S_IFLNK && !safe_link_target(member, archive_entry_symlink(entry))) {
+            report_error(error, error_size, "压缩包含有指向解压目录之外的链接。", NULL);
+            goto finish;
+        }
         char *destination = NULL;
         if (asprintf(&destination, "%s/%s", staging, member) < 0) {
             report_error(error, error_size, "无法分配解压所需的内存。", NULL);
             goto finish;
         }
         archive_entry_set_pathname(entry, destination);
-        free(destination);
+        if (type == S_IFLNK) {
+            struct extracted_link *link = calloc(1, sizeof(*link));
+            if (!link) {
+                free(destination);
+                report_error(error, error_size, "无法分配解压所需的内存。", NULL);
+                goto finish;
+            }
+            link->path = destination;
+            link->next = links;
+            links = link;
+        } else {
+            free(destination);
+        }
         archive_entry_set_perm(entry,
             type == S_IFDIR ? 0755 : 0644 | (archive_entry_perm(entry) & 0111));
         if (archive_read_extract2(reader, entry, writer) != ARCHIVE_OK) {
@@ -181,9 +232,39 @@ int extract_archive(const char *source, const char *staging,
         }
         close(item);
     }
+    // realpath follows the complete chain, including parent symlinks. Reject
+    // dangling/cyclic links as well as links escaping through another link.
+    char root[PATH_MAX];
+    if (links && !realpath(staging, root)) {
+        report_error(error, error_size, "无法校验解压目录。", NULL);
+        goto finish;
+    }
+    for (struct extracted_link *link = links; link; link = link->next) {
+        char resolved[PATH_MAX];
+        size_t n = strlen(root);
+        // A lone top-level directory is published without its staging parent.
+        // Nested links must stay inside that directory so relocation cannot
+        // turn a staging-local link into a link to unrelated destination files.
+        const char *relative = link->path + strlen(staging) + 1;
+        const char *slash = strchr(relative, '/');
+        size_t top_length = slash ? (size_t)(slash - relative) : 0;
+        if (!realpath(link->path, resolved) ||
+            strncmp(root, resolved, n) != 0 || resolved[n] != '/' ||
+            (top_length && (strncmp(resolved + n + 1, relative, top_length) != 0 ||
+             (resolved[n + 1 + top_length] != '/' && resolved[n + 1 + top_length] != '\0')))) {
+            report_error(error, error_size, "压缩包的链接无效或指向解压目录之外。", NULL);
+            goto finish;
+        }
+    }
     result = 0;
 
 finish:
+    while (links) {
+        struct extracted_link *next = links->next;
+        free(links->path);
+        free(links);
+        links = next;
+    }
     if (writer) {
         archive_write_free(writer);
     }

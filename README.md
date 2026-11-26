@@ -1,7 +1,7 @@
 # 夏威夷果开罐器
 适用于 Apple 芯片 Mac，需 macOS 12 或更新版本。
 
-1. 从 [Releases](../../releases/latest) 下载安装 ZIP 并解压，双击「安装夏威夷果开罐器（双击安装）.app」。
+1. 从 [Releases](../../releases/latest) 下载 `ArchiveHere-v1.3.1-Installer.zip` 并解压，双击「安装夏威夷果开罐器.app」。
 2. 在窗口中点左边的应用图标。进度条完成后，「夏威夷果开罐器.app」就位于「应用程序」。
 3. 点右边的终端图标，按终端提示完成当前账户的默认打开方式设置。macOS 若显示确认提示，请按需确认。
 
@@ -21,3 +21,9 @@ Zstandard（.zst）、加密包和分卷包暂不支持。
 ## 从源码构建
 
 在 Apple 芯片 Mac 上安装 Xcode 命令行工具，然后运行 `./build-launcher.sh`。安装器生成在 `build/` 中。
+
+## 1.3.1 修复
+
+支持应用包和 Python.framework 使用的内部相对符号链接。仍拒绝硬链接、特殊文件、绝对链接、越界链接、循环及悬空链接，并保留解压期间的禁止跟随链接写入保护。发布单个目录前还会检查链接在移动后仍留在目录内部。
+
+回归检查：`python3 tests/test_archive.py /绝对路径/夏威夷果开罐器.app/Contents/MacOS/ArchiveHere`。
